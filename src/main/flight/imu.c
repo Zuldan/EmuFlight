@@ -92,14 +92,16 @@ STATIC_UNIT_TESTED quaternionProducts qpAttitude = QUATERNION_PRODUCTS_INITIALIZ
 quaternion qHeadfree = QUATERNION_INITIALIZE;
 quaternion qOffset = QUATERNION_INITIALIZE;
 
+quaternionProducts buffer = QUATERNION_PRODUCTS_INITIALIZE;
+
 // absolute angle inclination in multiple of 0.1 degree    180 deg = 1800
 attitudeEulerAngles_t attitude = EULER_INITIALIZE;
 
 PG_REGISTER_WITH_RESET_TEMPLATE(imuConfig_t, imuConfig, PG_IMU_CONFIG, 0);
 
 PG_RESET_TEMPLATE(imuConfig_t, imuConfig,
-                  .dcm_kp = 2500,
-                  .dcm_ki = 7,
+                  .dcm_kp = 5500,
+                  .dcm_ki = 10,
                   .small_angle = 180,
                   .accDeadband = {.xy = 40, .z = 40},
                   .acc_unarmedcal = 1
@@ -195,12 +197,18 @@ static void applyVectorError(float ez_ef, quaternion *vError) {
 }
 #endif
 
-static void applyAccError(quaternion *vAcc, quaternion *vError) {
+static void applyAccError(quaternion *vAcc, quaternion *vError, quaternion *gyroAvg) {
+    float accTrust = accIsHealthy(&vAcc);
+
+    const float spin_rate = sqrtf(sq(gyroAvg->x) + sq(gyroAvg->y) + sq(gyroAvg->z));
+
+    float spinTrust = constrainf (1.0f - spin_rate / DEGREES_TO_RADIANS(500), 0.0f, 1.0f);
+
     quaternionNormalize(vAcc);
     // Error is sum of cross product between estimated direction and measured direction of gravity
-    vError->x += (vAcc->y * (1.0f - 2.0f * qpAttitude.xx - 2.0f * qpAttitude.yy) - vAcc->z * (2.0f * (qpAttitude.yz - -qpAttitude.wx)));
-    vError->y += (vAcc->z * (2.0f * (qpAttitude.xz + -qpAttitude.wy)) - vAcc->x * (1.0f - 2.0f * qpAttitude.xx - 2.0f * qpAttitude.yy));
-    vError->z += (vAcc->x * (2.0f * (qpAttitude.yz - -qpAttitude.wx)) - vAcc->y * (2.0f * (qpAttitude.xz + -qpAttitude.wy)));
+    vError->x += (vAcc->y * (1.0f - 2.0f * qpAttitude.xx - 2.0f * qpAttitude.yy) - vAcc->z * (2.0f * (qpAttitude.yz - -qpAttitude.wx))) * accTrust * spinTrust;
+    vError->y += (vAcc->z * (2.0f * (qpAttitude.xz + -qpAttitude.wy)) - vAcc->x * (1.0f - 2.0f * qpAttitude.xx - 2.0f * qpAttitude.yy)) * accTrust * spinTrust;
+    vError->z += (vAcc->x * (2.0f * (qpAttitude.yz - -qpAttitude.wx)) - vAcc->y * (2.0f * (qpAttitude.xz + -qpAttitude.wy))) * accTrust * spinTrust;
 }
 
 static void applySensorCorrection(quaternion *vError) {
@@ -274,6 +282,7 @@ static void imuMahonyAHRSupdate(float dt, quaternion *vGyro, quaternion *vError)
     // PCDM Acta Mech 224, 3091–3109 (2013)
     const float vGyroModulus = quaternionModulus(vGyro);
     // reduce gyro noise integration integrate only above vGyroStdDevModulus
+    // only use gyro data when the gyro is moving more than the random noise the gyro has on the ground
     if (vGyroModulus > vGyroStdDevModulus) {
         qDiff.w = cosf(vGyroModulus * 0.5f * dt);
         qDiff.x = sinf(vGyroModulus * 0.5f * dt) * (vGyro->x / vGyroModulus);
@@ -302,7 +311,6 @@ static void imuMahonyAHRSupdate(float dt, quaternion *vGyro, quaternion *vError)
 }
 
 STATIC_UNIT_TESTED void imuUpdateEulerAngles(void) {
-    quaternionProducts buffer;
     if (FLIGHT_MODE(HEADFREE_MODE)) {
         quaternionMultiply(&qOffset, &qAttitude, &qHeadfree);
         quaternionComputeProducts(&qHeadfree, &buffer);
@@ -312,9 +320,11 @@ STATIC_UNIT_TESTED void imuUpdateEulerAngles(void) {
     attitude.values.roll = lrintf(atan2_approx((+2.0f * (buffer.wx + buffer.yz)), (+1.0f - 2.0f * (buffer.xx + buffer.yy))) * (1800.0f / M_PIf));
     attitude.values.pitch = lrintf(((0.5f * M_PIf) - acos_approx(+2.0f * (buffer.wy - buffer.xz))) * (1800.0f / M_PIf));
     attitude.values.yaw = lrintf((-atan2_approx((+2.0f * (buffer.wz + buffer.xy)), (+1.0f - 2.0f * (buffer.yy + buffer.zz))) * (1800.0f / M_PIf)));
+
     if (attitude.values.yaw < 0) {
         attitude.values.yaw += 3600;
     }
+
     if (getCosTiltAngle() > smallAngleCosZ) {
         ENABLE_STATE(SMALL_ANGLE);
     } else {
@@ -339,7 +349,7 @@ static void imuCalculateEstimatedAttitude(timeUs_t currentTimeUs) {
     accGetAverage(&vAccAverage);
     DEBUG_SET(DEBUG_IMU, DEBUG_IMU2, lrintf((quaternionModulus(&vAccAverage) / acc.dev.acc_1G) * 1000));
     if (accIsHealthy(&vAccAverage)) {
-        applyAccError(&vAccAverage, &vError);
+        applyAccError(&vAccAverage, &vError, &vGyroAverage);
     }
     applySensorCorrection(&vError);
     imuMahonyAHRSupdate(deltaT * 1e-6f, &vGyroAverage, &vError);
@@ -428,5 +438,13 @@ bool imuQuaternionHeadfreeOffsetSet(void) {
         return (true);
     } else {
         return (false);
+    }
+}
+
+float getAngleModeAngles(int axis) {
+    if (axis == FD_ROLL) {
+        return lrintf(((0.5f * M_PIf) - acos_approx((2.0f * (buffer.yz + buffer.wx)))) * (1800.0f / M_PIf));
+    } else {
+        return attitude.values.pitch;
     }
 }
